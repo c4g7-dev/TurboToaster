@@ -1,0 +1,4 @@
+opencv-python>=4.8
+numpy>=1.24
+# pygame is optional — install if you want gamepad support in drive.py
+# pygame>=2.5
