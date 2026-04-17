@@ -85,13 +85,23 @@ and confirm I2C is enabled.
 ## Step 4 — Start the stream on the Pi
 
 ```bash
+# Optional but recommended: enable the LAN manual-override listener by
+# setting a shared keyword. Any LAN client that wants to grab the wheel
+# will need to send this same keyword.
+export TURBOTOASTER_CONTROL_KEY='pick-a-shared-keyword'
+
 python3 car/stream.py
 ```
 
 Output:
 ```
+10:32:11  INFO      Manual-override listener on 0.0.0.0:5001 (auth required)
 10:32:11  INFO      Listening on 0.0.0.0:5000  [640x480 @ 30 fps] — waiting for PC...
 ```
+
+If you don't set `TURBOTOASTER_CONTROL_KEY` (or pass `--control-key`) the
+manual-override listener stays disabled and only the AI channel on port 5000
+is open.
 
 Leave this running and switch to your PC.
 
@@ -140,6 +150,44 @@ short W press with the car still elevated before putting it on the ground.
 
 ---
 
+## Step 7 — LAN manual-override test (optional)
+
+This is the low-latency fallback: a tiny, video-free client that connects
+straight to the Pi from **any machine on the same WiFi**, so you're not
+paying for a round-trip out to the remote AI PC (the RTX 3090 box) when you
+need to grab the wheel.
+
+Make sure you started `car/stream.py` in **Step 4** with
+`TURBOTOASTER_CONTROL_KEY` set (otherwise the override listener is disabled).
+
+On the LAN-local machine:
+
+```bash
+pip install -r server/requirements.txt   # opencv-python, numpy
+
+export TURBOTOASTER_CONTROL_KEY='pick-a-shared-keyword'   # same as the Pi
+python3 server/manual_control.py --host aicar.local
+```
+
+A small status window opens ("LAN OVERRIDE" banner + steer/throttle bars —
+no video stream). Controls are the same as `drive.py`:
+
+| Key | Action |
+|-----|--------|
+| W / Up | Increase throttle |
+| S / Down | Decrease throttle / reverse |
+| A / Left | Steer left |
+| D / Right | Steer right |
+| Space | Emergency stop |
+| R | Release override (hand back to the AI) |
+| Q / Esc | Quit |
+
+As long as this client is active, the Pi ignores commands from the remote
+AI channel. Pressing **R** or closing the window hands control back within
+about half a second.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -150,3 +198,4 @@ short W press with the car still elevated before putting it on the ground.
 | Stream connects but no image | Camera cable problem | Re-seat CSI ribbon on both ends |
 | Low FPS or choppy stream | On 2.4 GHz WiFi | Switch Pi and PC to the 5 GHz band |
 | ESC no arming beep | ESC needs full-range calibration | Consult your ESC manual for calibration steps |
+| `manual_control.py` says "Auth failed" | Keyword mismatch, or listener not enabled on Pi | Ensure `TURBOTOASTER_CONTROL_KEY` is identical on both sides and that the Pi's stream.py logged the "Manual-override listener" line on startup |
