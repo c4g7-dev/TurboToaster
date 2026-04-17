@@ -1,34 +1,53 @@
 # TurboToaster
 
 3D-printed RC car with AI self-driving. A Raspberry Pi 5 on the car streams camera
-video over WiFi; a PC with an RTX 3080 Ti handles inference and sends drive commands
-back in real time.
+video over WiFi; a remote PC with an **RTX 3090** — living at a separate physical
+location — handles inference and sends drive commands back. Because that inference
+PC is off-site, its round-trip latency stacks on top of the inherent video-frame
+latency, which will stay interesting to tune as driving speed goes up.
+
+To keep a low-latency escape hatch, a second **LAN-local manual-control** channel
+is also provided. Any machine on the same WiFi as the car (laptop, phone-tethered
+box, another Pi) can attach to it with a small pre-shared auth keyword and grab
+the wheel. While the LAN override is active the Pi ignores the remote AI's
+commands, so the two don't fight.
 
 ## Architecture
 
 ```
-Pi 5 (on car)                    PC (RTX 3080 Ti)
-─────────────────────            ─────────────────────────
-camera → car/stream.py  ──────▶  server/drive.py
-car/control.py          ◀──────  keyboard / AI model
-PCA9685 → servo + ESC
+ Pi 5 (on car)                       Remote PC (RTX 3090, off-site)
+ ──────────────────                   ──────────────────────────────
+ camera ─▶ car/stream.py  ─TCP 5000─▶ server/drive.py  (AI / keyboard)
+ control.py              ◀──────────  {steer, throttle} JSON
+ PCA9685 → servo + ESC
+        ▲
+        │  TCP 5001 (auth'd, low-latency, LAN-only)
+        │
+ server/manual_control.py  ──  laptop/phone on the same WiFi
 ```
 
-Communication: length-prefixed TCP on port 5000.  
-Pi → PC: JPEG frames. PC → Pi: JSON `{"steer": float, "throttle": float}`.
+Communication: length-prefixed TCP.
+- Pi → PC: JPEG frames on port **5000**.
+- PC → Pi: JSON `{"steer": float, "throttle": float}` on port **5000** (AI) or
+  port **5001** (LAN manual-override, after an `{"auth": "<keyword>"}` handshake).
+
+Manual-override priority: whenever a LAN manual command arrives it is applied
+immediately and any remote AI commands are ignored for a short grace period
+(~0.5 s) so the remote AI can't "fight" the local driver.
 
 ## Repository layout
 
 ```
 car/
-  stream.py           Main process: streams camera, receives commands
+  stream.py           Main process: streams camera, accepts AI + LAN commands
   control.py          PCA9685 servo/ESC wrapper
   test_hardware.py    First-run hardware test (I2C + servo sweep)
   requirements.txt
 
 server/
   view_stream.py      View the Pi's camera stream (no control)
-  drive.py            Manual drive: stream + keyboard control
+  drive.py            AI / keyboard drive client (port 5000, with video)
+  manual_control.py   LAN-local manual-override client (port 5001, no video)
   requirements.txt
 
 docs/
@@ -49,11 +68,13 @@ pip3 install --break-system-packages -r car/requirements.txt
 # 1. Verify hardware (I2C, servo, ESC)
 python3 car/test_hardware.py
 
-# 2. Start streaming
+# 2. Start streaming. Pick any shared keyword — the LAN manual-override
+#    listener is enabled only when a key is configured.
+export TURBOTOASTER_CONTROL_KEY='pick-a-shared-keyword'
 python3 car/stream.py
 ```
 
-### On the PC
+### On the remote AI PC (RTX 3090, off-site)
 
 ```bash
 pip install -r server/requirements.txt
@@ -61,11 +82,23 @@ pip install -r server/requirements.txt
 # View stream only
 python3 server/view_stream.py --host aicar.local
 
-# Manual drive (WASD / arrow keys)
+# Manual drive with video (WASD / arrow keys) — this is the AI-channel client
 python3 server/drive.py --host aicar.local
 ```
 
-**Drive keys:** W/S = throttle, A/D = steer, Space = emergency stop, Q = quit.
+### On any LAN-local machine (low-latency manual override)
+
+```bash
+pip install -r server/requirements.txt
+
+export TURBOTOASTER_CONTROL_KEY='pick-a-shared-keyword'   # same as the Pi
+python3 server/manual_control.py --host aicar.local
+# or pass the key explicitly:
+python3 server/manual_control.py --host 192.168.1.42 --key pick-a-shared-keyword
+```
+
+**Drive keys:** W/S = throttle, A/D = steer, Space = emergency stop,
+R = release override (hand back to the AI), Q = quit.
 
 ## Hardware
 
