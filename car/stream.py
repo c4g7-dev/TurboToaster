@@ -163,7 +163,7 @@ def _recv_framed(conn: socket.socket, buf: bytearray, max_len: int = 65536):
     try:
         return json.loads(payload)
     except json.JSONDecodeError:
-        return {}
+        return None
 
 
 def _handle_control_client(
