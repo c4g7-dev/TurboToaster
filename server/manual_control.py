@@ -52,6 +52,8 @@ CMD_HZ = 30          # a bit higher than drive.py — no video to pace us
 STEER_STEP = 0.10
 THROTTLE_STEP = 0.10
 
+_CMD_SEQ = 0
+
 
 # ---------------------------------------------------------------------------
 # Framed JSON helpers
@@ -188,8 +190,12 @@ def main() -> int:
 
             now = time.monotonic()
             if now - last_cmd_t >= cmd_interval:
+                global _CMD_SEQ
+                _CMD_SEQ += 1
                 if not _send(conn, {"steer": round(steer, 3),
-                                    "throttle": round(throttle, 3)}):
+                                    "throttle": round(throttle, 3),
+                                    "ts": time.time(),
+                                    "seq": _CMD_SEQ}):
                     print("Connection lost.")
                     connected = False
                     break

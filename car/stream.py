@@ -59,8 +59,12 @@ log = logging.getLogger(__name__)
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5000
 DEFAULT_CONTROL_PORT = 5001
-MANUAL_HOLD_SEC = 0.5  # after each manual cmd, ignore AI cmds for this long
-JPEG_QUALITY = 80
+MANUAL_HOLD_SEC = 0.5     # after each manual cmd, ignore AI cmds for this long
+STALE_CMD_SEC = 0.3      # drop AI commands older than this (wall-clock)
+JPEG_QUALITY = 75
+DEFAULT_WIDTH = 480      # model-friendly; hw-encode + cheap WAN bandwidth
+DEFAULT_HEIGHT = 270
+DEFAULT_FPS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +74,42 @@ JPEG_QUALITY = 80
 # ---------------------------------------------------------------------------
 
 class CommandBroker:
-    def __init__(self, car: CarControl, manual_hold_sec: float = MANUAL_HOLD_SEC):
+    def __init__(
+        self,
+        car: CarControl,
+        manual_hold_sec: float = MANUAL_HOLD_SEC,
+        stale_cmd_sec: float = STALE_CMD_SEC,
+    ):
         self._car = car
         self._hold_sec = manual_hold_sec
+        self._stale_sec = stale_cmd_sec
         self._manual_hold_until = 0.0
+        self._last_ai_seq = -1
         self._lock = threading.Lock()
 
-    def apply_ai(self, steer: float, throttle: float) -> None:
+    def _is_stale(self, ts: float | None) -> bool:
+        if ts is None or self._stale_sec <= 0:
+            return False
+        # Assumes PC clock is NTP-synced with the Pi (usually fine on LAN; on
+        # WAN still within ~50 ms which is well under the default threshold).
+        return (time.time() - float(ts)) > self._stale_sec
+
+    def apply_ai(
+        self,
+        steer: float,
+        throttle: float,
+        ts: float | None = None,
+        seq: int | None = None,
+    ) -> None:
         with self._lock:
             if time.monotonic() < self._manual_hold_until:
                 return  # manual override active — ignore AI
+            if self._is_stale(ts):
+                return  # command older than threshold — drop
+            if seq is not None:
+                if seq <= self._last_ai_seq:
+                    return  # out-of-order / duplicate
+                self._last_ai_seq = int(seq)
             self._car.set_steering(steer)
             self._car.set_throttle(throttle)
 
@@ -122,6 +152,8 @@ def _command_receiver(conn: socket.socket, broker: CommandBroker) -> None:
                     broker.apply_ai(
                         float(cmd.get("steer", 0.0)),
                         float(cmd.get("throttle", 0.0)),
+                        ts=cmd.get("ts"),
+                        seq=cmd.get("seq"),
                     )
                 except (json.JSONDecodeError, ValueError, KeyError) as exc:
                     log.warning("Bad command: %s", exc)
@@ -228,6 +260,66 @@ def _control_listener(host: str, port: int, broker: CommandBroker, auth_key: str
 
 
 # ---------------------------------------------------------------------------
+# Newest-frame slot  \u2014 capture thread fills, sender thread drains.
+# If the network (WAN to remote 3090) falls behind, capture simply overwrites
+# the pending frame so we never send stale imagery. This keeps glass-to-wheel
+# latency bounded by the *current* link speed, not by queue depth.
+# ---------------------------------------------------------------------------
+
+class _FrameSlot:
+    __slots__ = ("_cond", "_jpeg", "_dropped", "_closed")
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._jpeg: bytes | None = None
+        self._dropped = 0
+        self._closed = False
+
+    def put(self, jpeg: bytes) -> None:
+        with self._cond:
+            if self._jpeg is not None:
+                self._dropped += 1
+            self._jpeg = jpeg
+            self._cond.notify()
+
+    def get(self) -> bytes | None:
+        with self._cond:
+            while self._jpeg is None and not self._closed:
+                self._cond.wait()
+            if self._closed and self._jpeg is None:
+                return None
+            jpeg = self._jpeg
+            self._jpeg = None
+            return jpeg
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+    @property
+    def dropped(self) -> int:
+        return self._dropped
+
+
+def _capture_loop(cam, slot: _FrameSlot, stop: threading.Event) -> None:
+    """Grab + JPEG-encode in a dedicated thread; push into the slot."""
+    while not stop.is_set():
+        try:
+            frame_rgb = cam.capture_array()
+        except Exception as exc:
+            log.warning("capture failed: %s", exc)
+            break
+        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode(
+            ".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
+        )
+        if ok:
+            slot.put(buf.tobytes())
+    slot.close()
+
+
+# ---------------------------------------------------------------------------
 # Client handler
 # ---------------------------------------------------------------------------
 
@@ -250,7 +342,16 @@ def _handle_client(
     cam.start()
     time.sleep(0.3)  # let sensor settle
 
-    # start command-receiver thread
+    slot = _FrameSlot()
+    stop = threading.Event()
+
+    # capture thread
+    cap_thread = threading.Thread(
+        target=_capture_loop, args=(cam, slot, stop), daemon=True
+    )
+    cap_thread.start()
+
+    # command-receiver thread
     recv_thread = threading.Thread(
         target=_command_receiver, args=(conn, broker), daemon=True
     )
@@ -261,16 +362,9 @@ def _handle_client(
 
     try:
         while True:
-            frame_rgb = cam.capture_array()
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            ok, buf = cv2.imencode(
-                ".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
-            )
-            if not ok:
-                continue
-
-            data = buf.tobytes()
+            data = slot.get()
+            if data is None:
+                break
             try:
                 conn.sendall(struct.pack(">I", len(data)) + data)
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -279,13 +373,24 @@ def _handle_client(
             frames_sent += 1
             if frames_sent % 100 == 0:
                 elapsed = time.monotonic() - t_start
-                log.info("Streaming %.1f FPS", frames_sent / elapsed)
+                log.info(
+                    "Streaming %.1f FPS  (dropped %d pre-send)",
+                    frames_sent / elapsed, slot.dropped,
+                )
 
     finally:
+        stop.set()
+        slot.close()
         cam.stop()
         broker.stop()
-        conn.close()
-        log.info("AI client disconnected: %s:%d  (%d frames sent)", addr[0], addr[1], frames_sent)
+        try:
+            conn.close()
+        except OSError:
+            pass
+        log.info(
+            "AI client disconnected: %s:%d  (%d frames sent, %d dropped)",
+            addr[0], addr[1], frames_sent, slot.dropped,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -296,9 +401,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="TurboToaster Pi stream server")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
+    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
     parser.add_argument(
         "--control-port",
         type=int,

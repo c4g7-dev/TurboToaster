@@ -1,0 +1,13 @@
+# AI server deps \u2014 install on the RTX 3090 box.
+#   pip install -r ai/requirements.txt
+#
+# Torch: install the CUDA build that matches your driver separately, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# This file only pins the things that aren't torch itself.
+torch>=2.2
+torchvision>=0.17
+numpy>=1.24
+opencv-python>=4.8
+
+# Optional \u2014 only needed for ai/perceive.py (YOLOv8n sidecar)
+ultralytics>=8.1

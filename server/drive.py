@@ -32,11 +32,16 @@ import time
 import cv2
 import numpy as np
 
+from recorder import SessionRecorder
+
 DEFAULT_HOST   = "aicar.local"
 DEFAULT_PORT   = 5000
 CMD_HZ         = 20          # command send rate
 STEER_STEP     = 0.10        # steer increment per keypress
 THROTTLE_STEP  = 0.10        # throttle increment per keypress
+
+# module-level monotonically increasing command sequence
+_CMD_SEQ = 0
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +72,14 @@ def _recv_frame(conn: socket.socket, buf: bytearray) -> np.ndarray | None:
 
 
 def _send_command(conn: socket.socket, steer: float, throttle: float) -> bool:
-    data = json.dumps(
-        {"steer": round(steer, 3), "throttle": round(throttle, 3)}
-    ).encode()
+    global _CMD_SEQ
+    _CMD_SEQ += 1
+    data = json.dumps({
+        "steer": round(steer, 3),
+        "throttle": round(throttle, 3),
+        "ts": time.time(),
+        "seq": _CMD_SEQ,
+    }).encode()
     try:
         conn.sendall(struct.pack(">I", len(data)) + data)
         return True
@@ -122,6 +132,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="TurboToaster manual drive client")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Pi hostname or IP")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--record",
+        nargs="?",
+        const="datasets",
+        default=None,
+        metavar="DIR",
+        help="Record frames + commands as a dataset session under DIR "
+             "(default: ./datasets). Each drive becomes a training tub.",
+    )
     args = parser.parse_args()
 
     print(f"Connecting to {args.host}:{args.port} ...")
@@ -129,6 +148,10 @@ def main() -> None:
     conn.connect((args.host, args.port))
     conn.settimeout(5.0)
     print("Connected — use WASD/arrows to drive, Space to stop, Q to quit.")
+
+    recorder = SessionRecorder(args.record) if args.record else None
+    if recorder:
+        print(f"Recording dataset to {recorder.dir}")
 
     steer    = 0.0
     throttle = 0.0
@@ -149,6 +172,9 @@ def main() -> None:
             now = time.monotonic()
             fps = 0.9 * fps + 0.1 / max(now - prev_t, 1e-6)
             prev_t = now
+
+            if recorder is not None:
+                recorder.add(frame, steer, throttle)
 
             display = _draw_hud(frame, steer, throttle, fps)
             cv2.imshow("TurboToaster — Drive", display)
@@ -179,6 +205,9 @@ def main() -> None:
         _send_command(conn, 0.0, 0.0)
         conn.close()
         cv2.destroyAllWindows()
+        if recorder is not None:
+            recorder.close()
+            print(f"Dataset saved to {recorder.dir}")
         print("Disconnected.")
 
 
