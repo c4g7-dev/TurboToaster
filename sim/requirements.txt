@@ -1,0 +1,4 @@
+gym-donkeycar>=22.11.0
+gymnasium>=0.29
+numpy>=1.24
+opencv-python>=4.8

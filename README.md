@@ -70,6 +70,14 @@ ai/
   requirements.txt
   README.md
 
+sim/
+  bridge.py           Thin shim around gym-donkeycar; speaks the Pi's
+                      TCP protocol so drive.py / infer.py / recorder.py
+                      can target the sim with no code changes
+  README.md           Install + pen-test knobs (latency / jitter / drop
+                      / speed-cap / camera placement / terrain)
+  requirements.txt
+
 docs/
   first-test.md       Step-by-step guide for the first connection test
   hardware.md         Wiring diagram and parts list
@@ -145,6 +153,15 @@ The `ai/` directory contains a self-contained behavior-cloning stack:
    are currently only reported, not yet fed into the controller.
 
 Full walk-through: [ai/README.md](ai/README.md).
+
+## Simulator (pen-test without hardware)
+
+Rather than rolling our own, we use the proven **gym-donkeycar** Unity sim
+from the Donkey Car project. `sim/bridge.py` exposes it on the Pi's TCP
+protocol, so `drive.py`, `infer.py` and `recorder.py` work against it with
+no code changes — and you get knobs for **latency, jitter, packet drop,
+speed cap, camera placement and terrain** to stress-test the off-site WAN
+path. Full walk-through: [sim/README.md](sim/README.md).
 
 ## Hardware
 
